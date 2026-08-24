@@ -40,6 +40,27 @@ Item {
   // ---- usage state ----
   property var history: []               // [{ts, model, prompt, tokens, ms}]
 
+  // ---- hard limits -------------------------------------------------------
+  // Everything below the sidecar boundary is untrusted: the model controls the
+  // stream body, and usage.json is a plain user-writable file. Each limit is
+  // enforced at the earliest point it can be, so nothing unbounded is ever
+  // retained, buffered, or rendered.
+  readonly property int maxStreamBytes: 262144   // OS-level cap on the whole response
+  readonly property int maxLineChars: 16384      // one SSE event is tiny; this is generous
+  readonly property int maxAnswerChars: 40000    // cap on what QML retains and renders
+  readonly property int maxStateBytes: 262144    // cap on usage.json before it is parsed
+  readonly property int maxHistoryEntries: 200
+  readonly property int maxPromptChars: 120
+  // Upper bounds on retained numbers. Without these a tampered state file can
+  // put absurd values straight into the totals.
+  readonly property int maxEntryTokens: 1000000
+  readonly property int maxEntryMs: 86400000
+  // Local inference does not exceed this; anything above it is bad data, not a
+  // fast machine, so it is excluded from rates rather than shown.
+  readonly property int maxPlausibleRate: 100000
+
+  property bool truncated: false
+
   readonly property real tokPerSec: (elapsedMs > 0 && tokenCount > 0)
     ? (tokenCount / (elapsedMs / 1000)) : 0
 
@@ -94,18 +115,28 @@ Item {
     startedAt = Date.now()
     streaming = true
 
+    truncated = false
+
     var body = JSON.stringify({
       messages: [{ role: "user", content: root.prompt }],
       stream: true,
       max_tokens: 2048
     })
 
-    askProc.command = [
-      "curl", "-sN", "--max-time", "300",
-      "-X", "POST", root.sidecarUrl + "/chat/completions",
-      "-H", "Content-Type: application/json",
-      "-d", body
-    ]
+    // The prompt and the sidecar URL travel as environment values, never as
+    // text inside the shell command, so neither can alter the command line.
+    // `head -c` caps the response at the OS level: the parser cannot buffer or
+    // retain more than maxStreamBytes even from a single unterminated line, and
+    // when head exits curl takes SIGPIPE and stops producing.
+    askProc.environment = ({
+      "POTLUCK_ASK_URL": root.sidecarUrl + "/chat/completions",
+      "POTLUCK_ASK_BODY": body
+    })
+    askProc.command = ["bash", "-lc",
+      "curl -sN --max-time 300 -X POST \"$POTLUCK_ASK_URL\""
+      + " -H 'Content-Type: application/json'"
+      + " --data-binary \"$POTLUCK_ASK_BODY\""
+      + " | head -c " + root.maxStreamBytes]
     askProc.running = true
   }
 
@@ -122,6 +153,10 @@ Item {
     // SSE separates events with a blank line, so every line after the first
     // arrives with a leading newline still attached. Trim before matching, or
     // only the very first event is ever recognised.
+    // Drop absurdly long events rather than parsing them. head -c already caps
+    // the total, but a single event should never approach this.
+    if (String(raw).length > root.maxLineChars) { root.stopOverflow(); return }
+
     var line = String(raw).trim()
     if (line.indexOf("data:") !== 0) return
     var payload = line.substring(5).trim()
@@ -139,9 +174,25 @@ Item {
     }
     if (delta === "") return
 
+    if (root.answer.length + root.thinking.length + delta.length > root.maxAnswerChars) {
+      root.stopOverflow()
+      return
+    }
+
     root.tokenCount += 1
     root.elapsedMs = Date.now() - root.startedAt
     root.appendDelta(delta)
+  }
+
+  // Stop the producer the moment a cap is hit, and keep what was already
+  // received rather than discarding a usable answer.
+  function stopOverflow() {
+    if (!root.streaming) return
+    root.truncated = true
+    root.streaming = false
+    root.elapsedMs = Date.now() - root.startedAt
+    if (askProc.running) askProc.running = false
+    root.recordUsage()
   }
 
   // Reasoning models (Qwen3 among them) emit a <think>…</think> preamble before
@@ -207,22 +258,54 @@ Item {
     var entry = {
       ts: Date.now(),
       model: root.modelId,
-      prompt: root.prompt.substring(0, 120),
+      prompt: root.prompt.substring(0, root.maxPromptChars),
       tokens: root.tokenCount,
       ms: Math.round(root.elapsedMs)
     }
     var next = [entry].concat(root.history)
-    root.history = next.slice(0, 200)
+    root.history = next.slice(0, root.maxHistoryEntries)
     usageFile.setText(JSON.stringify(root.history, null, 2) + "\n")
   }
 
+  // usage.json is an ordinary user-writable file, so it is treated as untrusted
+  // input: size-capped before parsing, then every retained field is coerced to a
+  // known type and clamped. Nothing from disk reaches the UI unbounded.
   function loadUsage(raw) {
+    var text = String(raw || "")
+    if (text.length > root.maxStateBytes) {
+      console.warn("[potluck] usage.json exceeds " + root.maxStateBytes
+        + " bytes; ignoring it rather than retaining it")
+      root.history = []
+      return
+    }
+
+    var parsed
     try {
-      var parsed = JSON.parse(raw)
-      root.history = Array.isArray(parsed) ? parsed : []
+      parsed = JSON.parse(text)
     } catch (e) {
       root.history = []
+      return
     }
+    if (!Array.isArray(parsed)) { root.history = []; return }
+
+    var clean = []
+    for (var i = 0; i < parsed.length && clean.length < root.maxHistoryEntries; i++) {
+      var e = parsed[i]
+      if (!e || typeof e !== "object") continue
+      var tokens = Number(e.tokens)
+      var ms = Number(e.ms)
+      var ts = Number(e.ts)
+      clean.push({
+        ts: isFinite(ts) && ts > 0 ? Math.min(ts, Date.now()) : 0,
+        model: String(e.model || "").substring(0, 64),
+        prompt: String(e.prompt || "").substring(0, root.maxPromptChars),
+        tokens: isFinite(tokens) && tokens >= 0
+          ? Math.min(Math.floor(tokens), root.maxEntryTokens) : 0,
+        ms: isFinite(ms) && ms >= 0
+          ? Math.min(Math.floor(ms), root.maxEntryMs) : 0
+      })
+    }
+    root.history = clean
   }
 
   function totalAsks() { return history.length }
@@ -238,25 +321,39 @@ Item {
   function avgTokPerSec() {
     var tok = 0, ms = 0
     for (var i = 0; i < history.length; i++) {
-      tok += Number(history[i].tokens || 0)
-      ms += Number(history[i].ms || 0)
+      var e = history[i]
+      // Only entries that are individually plausible contribute, so one bad
+      // record cannot distort the aggregate.
+      if (root.rateOf(e.tokens, e.ms) < 0) continue
+      tok += Number(e.tokens || 0)
+      ms += Number(e.ms || 0)
     }
-    return ms > 0 ? tok / (ms / 1000) : 0
+    return root.rateOf(tok, ms)
   }
 
   function bestTokPerSec() {
-    var best = 0
+    var best = -1
     for (var i = 0; i < history.length; i++) {
       var e = history[i]
-      if (e.ms > 0) {
-        var r = Number(e.tokens || 0) / (Number(e.ms) / 1000)
-        if (r > best) best = r
-      }
+      var r = root.rateOf(e.tokens, e.ms)
+      if (r > best) best = r
     }
     return best
   }
 
-  function fmtRate(v) { return (Math.round(v * 10) / 10).toFixed(1) }
+  // Rates are only meaningful over a real interval; anything shorter reports as
+  // "-" rather than a number scaled by an almost-zero denominator.
+  function rateOf(tokens, ms) {
+    var t = Number(tokens), m = Number(ms)
+    if (!isFinite(t) || !isFinite(m) || m < 50 || t <= 0) return -1
+    var r = t / (m / 1000)
+    return r > root.maxPlausibleRate ? -1 : r
+  }
+
+  function fmtRate(v) {
+    if (!isFinite(v) || v < 0) return "-"
+    return (Math.round(v * 10) / 10).toFixed(1)
+  }
 
   function fmtAgo(ts) {
     var s = Math.max(0, Math.round((Date.now() - Number(ts)) / 1000))
@@ -359,6 +456,7 @@ Item {
             height: 22
 
             Text {
+              textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
               text: root.mode === "ask" ? "Ask Potluck" : "Potluck usage"
@@ -369,6 +467,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               anchors.right: parent.right
               anchors.verticalCenter: parent.verticalCenter
               text: root.mode === "ask"
@@ -407,6 +506,7 @@ Item {
               onAccepted: root.ask()
 
               Text {
+                textFormat: Text.PlainText
                 anchors.verticalCenter: parent.verticalCenter
                 visible: input.text === ""
                 text: "Ask the local model…  ·  Enter to send, Tab for usage, Esc to close"
@@ -433,6 +533,7 @@ Item {
               spacing: 8
 
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 visible: root.errorText !== ""
                 text: root.errorText
@@ -444,6 +545,7 @@ Item {
 
               // Reasoning, kept visible but subordinate to the answer.
               Text {
+                textFormat: Text.PlainText
                 width: parent.width
                 visible: root.thinking !== "" && root.answer === ""
                 text: root.thinking
@@ -470,6 +572,7 @@ Item {
 
           // ---- ask footer ----
           Text {
+            textFormat: Text.PlainText
             visible: root.mode === "ask"
             width: parent.width
             color: root.foreground
@@ -479,6 +582,9 @@ Item {
             text: {
               if (root.streaming)
                 return "streaming · " + root.tokenCount + " tokens · "
+                  + root.fmtRate(root.tokPerSec) + " tok/s"
+              if (root.truncated)
+                return "stopped at the size limit · " + root.tokenCount + " tokens · "
                   + root.fmtRate(root.tokPerSec) + " tok/s"
               if (root.tokenCount > 0)
                 return "done · " + root.tokenCount + " tokens · "
@@ -508,12 +614,14 @@ Item {
                 delegate: Column {
                   spacing: 2
                   Text {
+                    textFormat: Text.PlainText
                     text: modelData.v
                     color: root.foreground
                     font.family: root.fontFamily
                     font.pixelSize: 20
                   }
                   Text {
+                    textFormat: Text.PlainText
                     text: modelData.k
                     color: root.foreground
                     opacity: 0.5
@@ -532,6 +640,7 @@ Item {
             }
 
             Text {
+              textFormat: Text.PlainText
               visible: root.history.length === 0
               text: "No asks recorded yet. Press Tab and ask something."
               color: root.foreground
@@ -561,6 +670,7 @@ Item {
                     height: 30
 
                     Text {
+                      textFormat: Text.PlainText
                       anchors.left: parent.left
                       anchors.right: statsText.left
                       anchors.rightMargin: 12
@@ -574,11 +684,12 @@ Item {
                     }
 
                     Text {
+                      textFormat: Text.PlainText
                       id: statsText
                       anchors.right: parent.right
                       anchors.verticalCenter: parent.verticalCenter
                       text: (modelData.tokens || 0) + " tok · "
-                        + root.fmtRate(modelData.ms > 0 ? modelData.tokens / (modelData.ms / 1000) : 0)
+                        + root.fmtRate(root.rateOf(modelData.tokens, modelData.ms))
                         + " tok/s · " + root.fmtAgo(modelData.ts)
                       color: root.foreground
                       opacity: 0.45
