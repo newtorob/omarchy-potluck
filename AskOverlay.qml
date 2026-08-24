@@ -264,7 +264,11 @@ Item {
     }
     var next = [entry].concat(root.history)
     root.history = next.slice(0, root.maxHistoryEntries)
-    usageFile.setText(JSON.stringify(root.history, null, 2) + "\n")
+    usageWriter.environment = ({
+      "POTLUCK_STATE": root.statePath,
+      "POTLUCK_STATE_JSON": JSON.stringify(root.history, null, 2) + "\n"
+    })
+    usageWriter.running = true
   }
 
   // usage.json is an ordinary user-writable file, so it is treated as untrusted
@@ -364,19 +368,52 @@ Item {
   }
 
   Process {
-    id: mkStateDir
-    command: ["mkdir", "-p", Quickshell.env("HOME") + "/.local/state/omarchy-potluck"]
+    id: usageReader
     running: true
-    onExited: usageFile.reload()
+    environment: ({ "POTLUCK_STATE": root.statePath })
+    // The state file is replaceable by anything the user's account can create,
+    // so it is never handed to QML unbounded. FileView would read the whole
+    // file into the long-lived shell process before any check could run, follow
+    // a symlink to an arbitrary target, and block indefinitely on a FIFO. This
+    // refuses a symlink or non-regular path outright, caps the read at
+    // maxStateBytes in the pipe, and bounds a blocking open with a timeout, so
+    // at most maxStateBytes of a regular file is ever retained.
+    command: ["bash", "-lc",
+      'f="$POTLUCK_STATE"; d=$(dirname "$f");'
+      + ' [ -L "$d" ] && exit 5;'
+      + ' [ -L "$f" ] && exit 3;'
+      + ' [ -f "$f" ] || exit 4;'
+      + ' exec timeout 2 head -c ' + root.maxStateBytes + ' "$f"']
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadUsage(text)
+    }
+    onExited: function (exitCode) {
+      // 3 symlink, 4 missing/not a regular file, 5 symlinked directory.
+      if (exitCode === 3 || exitCode === 5) {
+        console.warn("[potluck] refusing to read usage state through a symlink")
+        root.history = []
+      } else if (exitCode !== 0) {
+        root.history = []
+      }
+    }
   }
 
-  FileView {
-    id: usageFile
-    path: root.statePath
-    atomicWrites: true
-    printErrors: false
-    onLoaded: root.loadUsage(text())
-    onLoadFailed: root.loadUsage("[]")
+  // Writes go through the same guards: never through a symlink or a
+  // non-regular path, and atomically via a temp file in the same directory.
+  Process {
+    id: usageWriter
+    environment: ({
+      "POTLUCK_STATE": root.statePath,
+      "POTLUCK_STATE_JSON": ""
+    })
+    command: ["bash", "-lc",
+      'f="$POTLUCK_STATE"; d=$(dirname "$f");'
+      + ' [ -L "$d" ] && exit 5;'
+      + ' mkdir -p "$d" || exit 1;'
+      + ' if [ -L "$f" ] || { [ -e "$f" ] && [ ! -f "$f" ]; }; then rm -f "$f" || exit 1; fi;'
+      + ' t=$(mktemp "$d/.usage.XXXXXX") || exit 1;'
+      + ' printf "%s" "$POTLUCK_STATE_JSON" > "$t" && mv -f "$t" "$f" || { rm -f "$t"; exit 1; }']
   }
 
   // Which model is answering — shown in the header and stamped on each entry.
