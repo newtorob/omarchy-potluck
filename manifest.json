@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "id": "newtorob.potluck",
+  "name": "Potluck",
+  "version": "0.1.0",
+  "author": "Rob Newton",
+  "license": "AGPL-3.0",
+  "description": "Potluck local-AI in the Omarchy bar and a summoned Ask overlay: sidecar health, the loaded model, streamed answers from the local model, and a usage view.",
+  "kinds": [
+    "bar-widget",
+    "overlay"
+  ],
+  "entryPoints": {
+    "barWidget": "Widget.qml",
+    "overlay": "AskOverlay.qml"
+  },
+  "barWidget": {
+    "displayName": "Potluck",
+    "description": "One bar pill: whether the Potluck sidecar is running, which model is loaded, and how much RAM is left. Click to launch or focus the app.",
+    "category": "AI",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "sidecarUrl": "http://127.0.0.1:8321",
+      "refreshIntervalSec": 10,
+      "showModelName": true,
+      "launchCommand": "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop"
+    },
+    "schema": [
+      {
+        "key": "sidecarUrl",
+        "type": "string",
+        "label": "Sidecar URL",
+        "defaultValue": "http://127.0.0.1:8321",
+        "description": "The Potluck local sidecar. Stays on loopback; nothing is sent off the machine."
+      },
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 2,
+        "max": 300,
+        "step": 1,
+        "defaultValue": 10
+      },
+      {
+        "key": "showModelName",
+        "type": "boolean",
+        "label": "Show the model name in the bar",
+        "defaultValue": true,
+        "description": "Off shows just the status dot, which suits a vertical bar."
+      },
+      {
+        "key": "launchCommand",
+        "type": "command",
+        "label": "Click action",
+        "defaultValue": "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop"
+      }
+    ]
+  },
+  "keepLoaded": true
+}
