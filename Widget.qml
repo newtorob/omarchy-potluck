@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell.Io
 
 // Potluck bar widget.
 //
@@ -43,6 +44,17 @@ Item {
   property int installedCount: 0
   property real installedBytes: 0
 
+  // Anything on the sidecar port is untrusted: --max-time bounds how long a
+  // response may take, not how large it may be, so every read is capped in
+  // bytes by the OS before QML collects it, and every retained string is
+  // clamped before it can reach a label or tooltip.
+  readonly property int maxHealthBytes: 16384
+  readonly property int maxHardwareBytes: 16384
+  readonly property int maxCatalogBytes: 262144
+  readonly property int maxNameChars: 96
+
+  function clamp(v) { return String(v === undefined || v === null ? "" : v).substring(0, root.maxNameChars) }
+
   // A vertical bar has no room for a name, so the dot stands alone there
   // regardless of the setting.
   readonly property bool wantText: showModelName && !(bar && bar.vertical)
@@ -69,26 +81,17 @@ Item {
   // Fire-and-forget JSON GET. Any failure (sidecar down, refused, malformed)
   // routes to onFail so a stopped app degrades to "offline" instead of
   // freezing the last-known values on screen.
-  function fetchJson(path, onOk, onFail) {
-    var xhr = new XMLHttpRequest()
-    xhr.onreadystatechange = function () {
-      if (xhr.readyState !== XMLHttpRequest.DONE) return
-      if (xhr.status === 200) {
-        try {
-          onOk(JSON.parse(xhr.responseText))
-          return
-        } catch (e) {
-          // fall through to onFail
-        }
-      }
-      if (onFail) onFail()
-    }
-    try {
-      xhr.open("GET", root.sidecarUrl + path)
-      xhr.send()
-    } catch (e) {
-      if (onFail) onFail()
-    }
+  // One bounded reader per endpoint. `head -c` caps the body in the pipe, so a
+  // process squatting on the sidecar port cannot make the long-lived shell
+  // buffer an arbitrarily large response before it is parsed.
+  function parseBounded(raw, cap) {
+    var text = String(raw || "")
+    if (text.length === 0 || text.length >= cap) return null
+    try { return JSON.parse(text) } catch (e) { return null }
+  }
+
+  function fetchCommand(path, cap) {
+    return ["bash", "-lc", 'curl -s --max-time 3 "$POTLUCK_URL" | head -c ' + cap]
   }
 
   function goOffline() {
@@ -103,49 +106,93 @@ Item {
   }
 
   function refresh() {
-    fetchJson("/health", function (h) {
-      root.online = true
-      root.modelLoaded = h.model_loaded === true
-      root.nCtx = h.n_ctx_loaded ? Number(h.n_ctx_loaded) : 0
+    healthProc.environment = ({ "POTLUCK_URL": root.sidecarUrl + "/health" })
+    healthProc.command = root.fetchCommand("/health", root.maxHealthBytes)
+    healthProc.running = true
+  }
 
-      var id = h.active_model_id ? String(h.active_model_id) : ""
-      if (id !== root.activeModelId) {
-        root.activeModelId = id
-        root.modelName = ""
-        // The catalog is the only place the human-readable name lives, so it
-        // is fetched on change rather than on every tick.
-        if (id !== "") root.refreshCatalog()
-      }
-      if (root.installedCount === 0) root.refreshCatalog()
+  function applyHealth(h) {
+    root.online = true
+    root.modelLoaded = h.model_loaded === true
+    var ctx = Number(h.n_ctx_loaded)
+    root.nCtx = isFinite(ctx) && ctx > 0 ? Math.min(Math.floor(ctx), 100000000) : 0
 
-      root.refreshHardware()
-    }, root.goOffline)
+    var id = root.clamp(h.active_model_id)
+    if (id !== root.activeModelId) {
+      root.activeModelId = id
+      root.modelName = ""
+      // The catalog is the only place the human-readable name lives, so it is
+      // fetched on change rather than on every tick.
+      if (id !== "") root.refreshCatalog()
+    }
+    if (root.installedCount === 0) root.refreshCatalog()
+    root.refreshHardware()
   }
 
   function refreshCatalog() {
-    fetchJson("/models", function (d) {
-      var models = Array.isArray(d) ? d : (d && d.models ? d.models : [])
-      var installed = 0
-      var bytes = 0
-      for (var i = 0; i < models.length; i++) {
-        var m = models[i]
-        if (m.installed === true) {
-          installed++
-          bytes += Number(m.size_on_disk || m.size_bytes || 0)
-        }
-        if (m.slug === root.activeModelId && m.name) root.modelName = String(m.name)
-      }
-      root.installedCount = installed
-      root.installedBytes = bytes
-    })
+    catalogProc.environment = ({ "POTLUCK_URL": root.sidecarUrl + "/models" })
+    catalogProc.command = root.fetchCommand("/models", root.maxCatalogBytes)
+    catalogProc.running = true
   }
 
   function refreshHardware() {
-    fetchJson("/hardware", function (hw) {
-      root.ramAvailableGb = Number(hw.ram_available_gb || 0)
-      root.ramTotalGb = Number(hw.ram_total_gb || 0)
-      root.gpuName = hw.gpu_name ? String(hw.gpu_name) : ""
-    })
+    hardwareProc.environment = ({ "POTLUCK_URL": root.sidecarUrl + "/hardware" })
+    hardwareProc.command = root.fetchCommand("/hardware", root.maxHardwareBytes)
+    hardwareProc.running = true
+  }
+
+  Process {
+    id: healthProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var h = root.parseBounded(text, root.maxHealthBytes)
+        if (h) root.applyHealth(h); else root.goOffline()
+      }
+    }
+  }
+
+  Process {
+    id: catalogProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var d = root.parseBounded(text, root.maxCatalogBytes)
+        if (!d) return
+        var models = Array.isArray(d) ? d : (d && d.models ? d.models : [])
+        var installed = 0, bytes = 0
+        // Bounded independently of the byte cap: a valid but enormous catalog
+        // must not turn into an unbounded loop or an absurd total.
+        var limit = Math.min(models.length, 500)
+        for (var i = 0; i < limit; i++) {
+          var m = models[i]
+          if (!m || typeof m !== "object") continue
+          if (m.installed === true) {
+            installed++
+            var sz = Number(m.size_on_disk || m.size_bytes || 0)
+            if (isFinite(sz) && sz > 0) bytes += Math.min(sz, 1e13)
+          }
+          if (m.slug === root.activeModelId && m.name) root.modelName = root.clamp(m.name)
+        }
+        root.installedCount = installed
+        root.installedBytes = bytes
+      }
+    }
+  }
+
+  Process {
+    id: hardwareProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var hw = root.parseBounded(text, root.maxHardwareBytes)
+        if (!hw) return
+        var avail = Number(hw.ram_available_gb), total = Number(hw.ram_total_gb)
+        root.ramAvailableGb = isFinite(avail) && avail >= 0 ? Math.min(avail, 1e6) : 0
+        root.ramTotalGb = isFinite(total) && total >= 0 ? Math.min(total, 1e6) : 0
+        root.gpuName = root.clamp(hw.gpu_name)
+      }
+    }
   }
 
   Timer {

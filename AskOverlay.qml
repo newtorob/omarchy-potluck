@@ -58,6 +58,8 @@ Item {
   // Local inference does not exceed this; anything above it is bad data, not a
   // fast machine, so it is excluded from rates rather than shown.
   readonly property int maxPlausibleRate: 100000
+  readonly property int maxHealthBytes: 16384
+  readonly property int maxModelIdChars: 96
 
   property bool truncated: false
 
@@ -227,7 +229,6 @@ Item {
   Process {
     id: askProc
     stdout: SplitParser { onRead: function (line) { root.onSseLine(line) } }
-    stderr: StdioCollector { waitForEnd: true }
     onExited: function (exitCode) {
       if (root.streaming) {
         // [DONE] never arrived — curl died, the sidecar went away, or the
@@ -419,13 +420,21 @@ Item {
   // Which model is answering — shown in the header and stamped on each entry.
   Process {
     id: healthProc
-    command: ["curl", "-s", "--max-time", "3", root.sidecarUrl + "/health"]
+    // --max-time bounds how long the response may take, not how large it may
+    // be, so the body is capped in the pipe before QML collects it. Anything
+    // holding the sidecar port is untrusted.
+    environment: ({ "POTLUCK_HEALTH_URL": root.sidecarUrl + "/health" })
+    command: ["bash", "-lc",
+      'curl -s --max-time 3 "$POTLUCK_HEALTH_URL" | head -c ' + root.maxHealthBytes]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
+        var raw = String(text || "")
+        // At the cap the body was truncated, so it is not trustworthy JSON.
+        if (raw.length === 0 || raw.length >= root.maxHealthBytes) { root.modelId = ""; return }
         try {
-          var h = JSON.parse(String(text))
-          root.modelId = h.active_model_id ? String(h.active_model_id) : ""
+          var h = JSON.parse(raw)
+          root.modelId = String(h.active_model_id || "").substring(0, root.maxModelIdChars)
         } catch (e) { root.modelId = "" }
       }
     }
