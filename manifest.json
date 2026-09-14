@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "newtorob.potluck",
   "name": "Potluck",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "Rob Newton",
   "license": "AGPL-3.0",
-  "description": "Potluck local-AI in the Omarchy bar and a summoned Ask overlay: sidecar health, the loaded model, streamed answers from the local model, and a usage view.",
+  "description": "Potluck local-AI in the Omarchy bar and a summoned Ask overlay: sidecar health, the loaded model and the device it runs on, streamed answers over Potluck's local API, and a usage view.",
   "kinds": [
     "bar-widget",
     "overlay"
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Potluck",
-    "description": "One bar pill: whether the Potluck sidecar is running, which model is loaded, and how much RAM is left. Left-click opens the Ask overlay; right-click launches or focuses the app.",
+    "description": "One bar pill: whether the Potluck sidecar is running, which model is loaded and on what device, and how much RAM is left. Left-click opens the Ask overlay; right-click launches or focuses the app.",
     "category": "AI",
     "allowMultiple": false,
     "defaultSection": "right",

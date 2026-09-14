@@ -9,6 +9,14 @@ import qs.Ui
 // model without opening the desktop app, plus a usage view over the asks made
 // through it.
 //
+// It talks to the sidecar's OpenAI-compatible local API (/v1), the door
+// Potluck opens for other programs on the machine (Settings → Connect tools),
+// with the key from ~/.potluck/config.json. A packaged Potluck locks its
+// internal routes behind a per-launch token that only the app holds, so /v1
+// is the only route an outside caller can use. Every ask is sent with
+// X-Potluck-Scope: local, so it runs on this machine or fails: it is never
+// routed to a household peer or the pool, whatever the app's own default.
+//
 // Usage is measured here rather than read back from the sidecar: the local
 // chat route persists no per-message token telemetry (only the cloud gateway
 // path returns a `usage` block), so the only honest source for "what have I
@@ -24,6 +32,12 @@ Item {
 
   readonly property string sidecarUrl: "http://127.0.0.1:8321"
   readonly property string statePath: Quickshell.env("HOME") + "/.local/state/omarchy-potluck/usage.json"
+  readonly property string configPath: Quickshell.env("HOME") + "/.potluck/config.json"
+
+  // ---- local API (gateway) state, from ~/.potluck/config.json ----
+  property bool gatewayEnabled: false
+  property string gatewayKey: ""
+  property bool copied: false
 
   // ---- ask state ----
   property string prompt: ""
@@ -60,6 +74,7 @@ Item {
   readonly property int maxPlausibleRate: 100000
   readonly property int maxHealthBytes: 16384
   readonly property int maxModelIdChars: 96
+  readonly property int maxConfigBytes: 65536
 
   property bool truncated: false
 
@@ -78,10 +93,29 @@ Item {
   // Lifecycle — the contract the shell's summon/hide/toggle routing expects.
   // ---------------------------------------------------------------------------
 
+  // `omarchy-shell shell summon newtorob.potluck '{"prompt": "..."}'` opens
+  // the overlay with that question already sent, so a keybinding or a menu
+  // entry can ask about the clipboard, a selection, or anything a script
+  // builds. Any other payload just opens it empty.
+  readonly property int maxSummonPromptChars: 8000
+
   function open(payloadJson) {
     root.opened = true
     root.mode = "ask"
     root.errorText = ""
+    var summoned = ""
+    try {
+      var payload = JSON.parse(String(payloadJson || "{}"))
+      if (payload && typeof payload.prompt === "string")
+        summoned = payload.prompt.substring(0, root.maxSummonPromptChars).trim()
+    } catch (e) {}
+    if (summoned !== "" && !root.streaming) {
+      input.text = summoned
+      root.prompt = summoned
+      // The key and the model id are re-read on open; give those reads a
+      // moment so the first summoned ask carries the current key.
+      Qt.callLater(function () { root.ask() })
+    }
     Qt.callLater(function () { input.forceActiveFocus() })
   }
 
@@ -125,21 +159,46 @@ Item {
       max_tokens: 2048
     })
 
-    // The prompt and the sidecar URL travel as environment values, never as
-    // text inside the shell command, so neither can alter the command line.
+    // The prompt, the URL and the key travel as environment values, never as
+    // text inside the shell command, so none of them can alter the command
+    // line. The bearer header is only added when a key is configured: a dev
+    // sidecar with no token gate answers on /v1 without one.
     // `head -c` caps the response at the OS level: the parser cannot buffer or
     // retain more than maxStreamBytes even from a single unterminated line, and
     // when head exits curl takes SIGPIPE and stops producing.
     askProc.environment = ({
-      "POTLUCK_ASK_URL": root.sidecarUrl + "/chat/completions",
-      "POTLUCK_ASK_BODY": body
+      "POTLUCK_ASK_URL": root.sidecarUrl + "/v1/chat/completions",
+      "POTLUCK_ASK_BODY": body,
+      "POTLUCK_ASK_KEY": root.gatewayKey
     })
-    askProc.command = ["bash", "-lc",
-      "curl -sN --max-time 300 -X POST \"$POTLUCK_ASK_URL\""
-      + " -H 'Content-Type: application/json'"
-      + " --data-binary \"$POTLUCK_ASK_BODY\""
-      + " | head -c " + root.maxStreamBytes]
+    askProc.command = ["bash", "-c",
+      'auth=(); if [ -n "$POTLUCK_ASK_KEY" ]; then auth=(-H "Authorization: Bearer $POTLUCK_ASK_KEY"); fi;'
+      + ' curl -sN --max-time 300 -X POST "$POTLUCK_ASK_URL"'
+      + ' -H "Content-Type: application/json"'
+      + ' -H "X-Potluck-Scope: local"'
+      + ' "${auth[@]}"'
+      + ' --data-binary "$POTLUCK_ASK_BODY"'
+      + ' | head -c ' + root.maxStreamBytes]
     askProc.running = true
+  }
+
+  // The gateway refuses a request with one JSON object instead of a stream.
+  // Say what to do about it rather than echoing the server.
+  function friendlyError(detail) {
+    var d = String(detail || "")
+    if (d.indexOf("gateway disabled") !== -1)
+      return "Potluck's local API is off. In Potluck: Settings → Connect tools → turn it on, then ask again."
+    if (d.indexOf("gateway API key") !== -1)
+      return "Potluck rejected the API key. Close and reopen this overlay to re-read ~/.potluck/config.json."
+    if (d.indexOf("No local model") !== -1 || d.indexOf("No model loaded") !== -1)
+      return "No model is loaded. Open Potluck and load one."
+    return d !== "" ? d.substring(0, 300) : "The sidecar returned an error."
+  }
+
+  function failWith(message) {
+    root.errorText = message
+    root.streaming = false
+    if (askProc.running) askProc.running = false
   }
 
   function cancel() {
@@ -160,7 +219,17 @@ Item {
     if (String(raw).length > root.maxLineChars) { root.stopOverflow(); return }
 
     var line = String(raw).trim()
-    if (line.indexOf("data:") !== 0) return
+    if (line === "") return
+    if (line.indexOf("data:") !== 0) {
+      // Not an event. The gateway answered the request itself with one JSON
+      // object: 401 (key rejected), 404 (gateway off), 503 (no model loaded).
+      try {
+        var refusal = JSON.parse(line)
+        if (refusal && typeof refusal === "object" && refusal.detail !== undefined)
+          root.failWith(root.friendlyError(refusal.detail))
+      } catch (e) {}
+      return
+    }
     var payload = line.substring(5).trim()
     if (payload === "" ) return
     if (payload === "[DONE]") { root.finish(); return }
@@ -168,6 +237,12 @@ Item {
     var delta = ""
     try {
       var obj = JSON.parse(payload)
+      if (obj && obj.error) {
+        // An in-stream failure (inference error mid-answer) arrives as an
+        // `error` event rather than a delta. Keep whatever text came first.
+        root.failWith(root.friendlyError(obj.error.message || "inference error"))
+        return
+      }
       var choices = obj.choices || []
       if (choices.length > 0 && choices[0].delta)
         delta = choices[0].delta.content || ""
@@ -417,6 +492,73 @@ Item {
       + ' printf "%s" "$POTLUCK_STATE_JSON" > "$t" && mv -f "$t" "$f" || { rm -f "$t"; exit 1; }']
   }
 
+  // ---------------------------------------------------------------------------
+  // Local API key
+  // ---------------------------------------------------------------------------
+
+  // The gateway switch and key live in ~/.potluck/config.json, the app's own
+  // settings file, which Settings → Connect tools writes. Read with the same
+  // guards as usage.json: never through a symlink, never more than
+  // maxConfigBytes, and only a key that looks like one is kept.
+  Process {
+    id: configReader
+    running: true
+    environment: ({ "POTLUCK_CONFIG": root.configPath })
+    command: ["bash", "-c",
+      'f="$POTLUCK_CONFIG";'
+      + ' [ -L "$f" ] && exit 3;'
+      + ' [ -f "$f" ] || exit 4;'
+      + ' exec timeout 2 head -c ' + root.maxConfigBytes + ' "$f"']
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.loadConfig(text)
+    }
+    onExited: function (exitCode) {
+      if (exitCode !== 0) { root.gatewayEnabled = false; root.gatewayKey = "" }
+    }
+  }
+
+  function loadConfig(raw) {
+    var text = String(raw || "")
+    root.gatewayEnabled = false
+    root.gatewayKey = ""
+    // At the cap the file was truncated, so it is not trustworthy JSON.
+    if (text.length === 0 || text.length >= root.maxConfigBytes) return
+    try {
+      var c = JSON.parse(text)
+      var gw = c && c.gateway
+      if (gw && typeof gw === "object") {
+        root.gatewayEnabled = gw.enabled === true
+        var key = String(gw.api_key || "")
+        if (root.gatewayEnabled && /^[A-Za-z0-9._\-]{8,256}$/.test(key)) root.gatewayKey = key
+      }
+    } catch (e) {}
+  }
+
+  // ---------------------------------------------------------------------------
+  // Clipboard
+  // ---------------------------------------------------------------------------
+
+  function copyAnswer() {
+    if (root.answer === "") return
+    copyProc.environment = ({ "POTLUCK_COPY_TEXT": root.answer })
+    copyProc.running = true
+    root.copied = true
+    copiedTimer.restart()
+  }
+
+  Process {
+    id: copyProc
+    environment: ({ "POTLUCK_COPY_TEXT": "" })
+    command: ["bash", "-c", 'printf "%s" "$POTLUCK_COPY_TEXT" | wl-copy']
+  }
+
+  Timer {
+    id: copiedTimer
+    interval: 1500
+    onTriggered: root.copied = false
+  }
+
   // Which model is answering — shown in the header and stamped on each entry.
   Process {
     id: healthProc
@@ -440,7 +582,7 @@ Item {
     }
   }
 
-  onOpenedChanged: if (opened) healthProc.running = true
+  onOpenedChanged: if (opened) { healthProc.running = true; configReader.running = true }
 
   // ---------------------------------------------------------------------------
   // UI
@@ -475,6 +617,14 @@ Item {
           root.mode = root.mode === "ask" ? "usage" : "ask"
           if (root.mode === "ask") Qt.callLater(function () { input.forceActiveFocus() })
           event.accepted = true
+        } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier)) {
+          // Ctrl+C copies the finished answer, unless the input has its own
+          // selection to copy; then the TextInput keeps the key.
+          if (root.mode === "ask" && root.answer !== "" && !root.streaming
+              && input.selectedText === "") {
+            root.copyAnswer()
+            event.accepted = true
+          }
         }
       }
 
@@ -626,6 +776,8 @@ Item {
             font.family: root.fontFamily
             font.pixelSize: 11
             text: {
+              if (root.copied)
+                return "answer copied to the clipboard"
               if (root.streaming)
                 return "streaming · " + root.tokenCount + " tokens · "
                   + root.fmtRate(root.tokPerSec) + " tok/s"
@@ -635,7 +787,9 @@ Item {
               if (root.tokenCount > 0)
                 return "done · " + root.tokenCount + " tokens · "
                   + root.fmtRate(root.tokPerSec) + " tok/s · "
-                  + (Math.round(root.elapsedMs / 100) / 10) + "s"
+                  + (Math.round(root.elapsedMs / 100) / 10) + "s · Ctrl+C to copy"
+              if (!root.gatewayEnabled)
+                return "Local API off? Potluck → Settings → Connect tools · Esc to close"
               return "Enter to send · Tab for usage · Esc to close"
             }
           }

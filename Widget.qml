@@ -1,4 +1,5 @@
 import QtQuick
+import Quickshell
 import Quickshell.Io
 
 // Potluck bar widget.
@@ -7,6 +8,11 @@ import Quickshell.Io
 // renders one pill: a status dot plus the loaded model's name. Everything it
 // shows already lives on this machine -- the sidecar is the same process the
 // app itself talks to, so this adds no network exposure of its own.
+//
+// Only /health is asked of the sidecar. A packaged Potluck locks every other
+// route behind a per-launch token that only the app holds, so the rest of
+// what the pill shows (installed models, the loaded model's name, free RAM,
+// whether the local API is on) is read from the app's own files on disk.
 //
 // Third-party plugins get `bar`, `moduleName`, and `settings` injected by the
 // bar after loading; see /usr/share/omarchy/shell/plugins/bar/README.md.
@@ -43,18 +49,26 @@ Item {
   property int nCtx: 0
   property real ramAvailableGb: 0
   property real ramTotalGb: 0
-  property string gpuName: ""
   property int installedCount: 0
   property real installedBytes: 0
+  // Where the loaded model actually runs, from the sidecar's own load report
+  // (/health `inference`). "unknown" until a llama.cpp model is loaded.
+  property string deviceKind: "unknown"
+  property string deviceName: ""
+  property string backendName: ""
+  property bool executionVerified: false
+  // Whether the app's local API (the /v1 gateway) is switched on. The Ask
+  // overlay needs it; the tooltip says so while it is off.
+  property bool gatewayEnabled: false
 
   // Anything on the sidecar port is untrusted: --max-time bounds how long a
   // response may take, not how large it may be, so every read is capped in
   // bytes by the OS before QML collects it, and every retained string is
   // clamped before it can reach a label or tooltip.
   readonly property int maxHealthBytes: 16384
-  readonly property int maxHardwareBytes: 16384
-  readonly property int maxCatalogBytes: 262144
+  readonly property int maxLocalBytes: 4096
   readonly property int maxNameChars: 96
+  readonly property string potluckDir: Quickshell.env("HOME") + "/.potluck"
 
   function clamp(v) { return String(v === undefined || v === null ? "" : v).substring(0, root.maxNameChars) }
 
@@ -84,9 +98,9 @@ Item {
   // Fire-and-forget JSON GET. Any failure (sidecar down, refused, malformed)
   // routes to onFail so a stopped app degrades to "offline" instead of
   // freezing the last-known values on screen.
-  // One bounded reader per endpoint. `head -c` caps the body in the pipe, so a
-  // process squatting on the sidecar port cannot make the long-lived shell
-  // buffer an arbitrarily large response before it is parsed.
+  // `head -c` caps every body in the pipe, so a process squatting on the
+  // sidecar port cannot make the long-lived shell buffer an arbitrarily large
+  // response before it is parsed.
   function parseBounded(raw, cap) {
     var text = String(raw || "")
     if (text.length === 0 || text.length >= cap) return null
@@ -105,7 +119,10 @@ Item {
     nCtx = 0
     ramAvailableGb = 0
     ramTotalGb = 0
-    gpuName = ""
+    deviceKind = "unknown"
+    deviceName = ""
+    backendName = ""
+    executionVerified = false
   }
 
   function refresh() {
@@ -124,24 +141,50 @@ Item {
     if (id !== root.activeModelId) {
       root.activeModelId = id
       root.modelName = ""
-      // The catalog is the only place the human-readable name lives, so it is
-      // fetched on change rather than on every tick.
-      if (id !== "") root.refreshCatalog()
     }
-    if (root.installedCount === 0) root.refreshCatalog()
-    root.refreshHardware()
+
+    // Where the model runs, as llama.cpp reported it during this exact load.
+    // A missing block means "no llama.cpp model loaded", not "CPU".
+    var inf = h.inference
+    if (inf && typeof inf === "object") {
+      root.deviceKind = root.clamp(inf.device_kind) || "unknown"
+      root.deviceName = root.clamp(inf.device_name)
+      root.backendName = root.clamp(inf.backend)
+      root.executionVerified = inf.execution_verified === true
+    } else {
+      root.deviceKind = "unknown"
+      root.deviceName = ""
+      root.backendName = ""
+      root.executionVerified = false
+    }
+    root.refreshLocal()
   }
 
-  function refreshCatalog() {
-    catalogProc.environment = ({ "POTLUCK_URL": root.sidecarUrl + "/models" })
-    catalogProc.command = root.fetchCommand("/models", root.maxCatalogBytes)
-    catalogProc.running = true
+  // Everything else the pill shows already lives on this machine as plain
+  // files, so it is read from disk rather than asked of the sidecar. One
+  // bounded process per tick, output capped before QML sees it.
+  //   ~/.potluck/models/<slug>/model.gguf         installed models and size
+  //   ~/.potluck/data/model_catalog_cache.json    the loaded model's name
+  //   ~/.potluck/config.json                      whether the local API is on
+  //   /proc/meminfo                               free RAM
+  function refreshLocal() {
+    localProc.environment = ({
+      "POTLUCK_DIR": root.potluckDir,
+      "POTLUCK_SLUG": root.activeModelId
+    })
+    localProc.running = true
   }
 
-  function refreshHardware() {
-    hardwareProc.environment = ({ "POTLUCK_URL": root.sidecarUrl + "/hardware" })
-    hardwareProc.command = root.fetchCommand("/hardware", root.maxHardwareBytes)
-    hardwareProc.running = true
+  function applyLocal(d) {
+    var n = Number(d.models), b = Number(d.bytes)
+    root.installedCount = isFinite(n) && n >= 0 ? Math.min(Math.floor(n), 500) : 0
+    root.installedBytes = isFinite(b) && b >= 0 ? Math.min(b, 1e13) : 0
+    var t = Number(d.memTotalKb), a = Number(d.memAvailKb)
+    root.ramTotalGb = isFinite(t) && t > 0 ? Math.min(t, 1e12) / 1048576 : 0
+    root.ramAvailableGb = isFinite(a) && a >= 0 ? Math.min(a, 1e12) / 1048576 : 0
+    root.gatewayEnabled = d.gateway === true
+    var name = root.clamp(d.name)
+    if (name !== "") root.modelName = name
   }
 
   Process {
@@ -156,44 +199,24 @@ Item {
   }
 
   Process {
-    id: catalogProc
+    id: localProc
+    // Shell metacharacters never reach this command line: the paths and the
+    // slug travel as environment values, and every jq program takes them as
+    // --arg variables. Reads refuse symlinks and are capped in bytes.
+    command: ["bash", "-c",
+      'd="$POTLUCK_DIR"; n=0; b=0;'
+      + ' for f in "$d"/models/*/model.gguf; do [ -f "$f" ] || continue; n=$((n+1)); sz=$(stat -Lc %s "$f" 2>/dev/null || echo 0); b=$((b+sz)); done;'
+      + ' t=$(awk "/^MemTotal:/{print \\$2; exit}" /proc/meminfo 2>/dev/null); a=$(awk "/^MemAvailable:/{print \\$2; exit}" /proc/meminfo 2>/dev/null);'
+      + ' gw=false; c="$d/config.json"; if [ -f "$c" ] && [ ! -L "$c" ]; then gw=$(head -c 65536 "$c" | jq -r "if .gateway.enabled == true then true else false end" 2>/dev/null); fi;'
+      + ' name=""; k="$d/data/model_catalog_cache.json"; if [ -n "$POTLUCK_SLUG" ] && [ -f "$k" ] && [ ! -L "$k" ]; then name=$(head -c 262144 "$k" | jq -r --arg s "$POTLUCK_SLUG" "[.models[]? | select(.slug == \\$s) | .name // empty] | first // \\"\\"" 2>/dev/null | head -c 96); fi;'
+      + ' case "$gw" in true|false) ;; *) gw=false ;; esac;'
+      + ' jq -cn --argjson n "$n" --argjson b "$b" --argjson t "${t:-0}" --argjson a "${a:-0}" --argjson gw "$gw" --arg name "$name" "{models:\\$n, bytes:\\$b, memTotalKb:\\$t, memAvailKb:\\$a, gateway:\\$gw, name:\\$name}"'
+      + ' | head -c ' + root.maxLocalBytes]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
-        var d = root.parseBounded(text, root.maxCatalogBytes)
-        if (!d) return
-        var models = Array.isArray(d) ? d : (d && d.models ? d.models : [])
-        var installed = 0, bytes = 0
-        // Bounded independently of the byte cap: a valid but enormous catalog
-        // must not turn into an unbounded loop or an absurd total.
-        var limit = Math.min(models.length, 500)
-        for (var i = 0; i < limit; i++) {
-          var m = models[i]
-          if (!m || typeof m !== "object") continue
-          if (m.installed === true) {
-            installed++
-            var sz = Number(m.size_on_disk || m.size_bytes || 0)
-            if (isFinite(sz) && sz > 0) bytes += Math.min(sz, 1e13)
-          }
-          if (m.slug === root.activeModelId && m.name) root.modelName = root.clamp(m.name)
-        }
-        root.installedCount = installed
-        root.installedBytes = bytes
-      }
-    }
-  }
-
-  Process {
-    id: hardwareProc
-    stdout: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var hw = root.parseBounded(text, root.maxHardwareBytes)
-        if (!hw) return
-        var avail = Number(hw.ram_available_gb), total = Number(hw.ram_total_gb)
-        root.ramAvailableGb = isFinite(avail) && avail >= 0 ? Math.min(avail, 1e6) : 0
-        root.ramTotalGb = isFinite(total) && total >= 0 ? Math.min(total, 1e6) : 0
-        root.gpuName = root.clamp(hw.gpu_name)
+        var d = root.parseBounded(text, root.maxLocalBytes)
+        if (d && typeof d === "object") root.applyLocal(d)
       }
     }
   }
@@ -212,6 +235,20 @@ Item {
 
   function formatGb(v) {
     return (Math.round(v * 10) / 10).toFixed(1) + " GB"
+  }
+
+  // "Runs on GPU  ·  vulkan  ·  Intel(R) Graphics (MTL)". Only what llama.cpp
+  // itself reported; "unverified" marks a load whose per-device buffers the
+  // engine never showed, so the device is a claim rather than evidence.
+  function runsOnText() {
+    var where = deviceKind === "gpu" ? "GPU"
+      : deviceKind === "mixed" ? "GPU + CPU"
+      : deviceKind === "cpu" ? "CPU" : "unknown device"
+    var s = "Runs on " + where
+    if (backendName !== "" && backendName !== "cpu") s += "  ·  " + backendName
+    if (deviceName !== "") s += "  ·  " + deviceName
+    if (!executionVerified) s += "  (unverified)"
+    return s
   }
 
   // -------------------------------------------------------------------------
@@ -246,10 +283,12 @@ Item {
       lines.push(installedCount + (installedCount === 1 ? " model" : " models")
         + " installed  ·  " + formatGb(installedBytes / 1073741824))
     }
+    if (modelLoaded && deviceKind !== "unknown")
+      lines.push(runsOnText())
     if (ramTotalGb > 0)
       lines.push("RAM " + formatGb(ramAvailableGb) + " free of " + formatGb(ramTotalGb))
-    if (gpuName !== "")
-      lines.push("GPU " + gpuName)
+    if (!gatewayEnabled)
+      lines.push("Ask needs the local API on: Potluck → Settings → Connect tools")
     lines.push(root.clickAction === "Launch app"
       ? "Click app  ·  right ask  ·  middle refresh"
       : "Click ask  ·  right app  ·  middle refresh")
