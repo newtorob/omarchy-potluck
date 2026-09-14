@@ -67,6 +67,8 @@ omarchy-shell shell call newtorob.potluck act '{"slug": "qwen3-4b-instruct-2507-
 
 ## Models view
 
+![models view](docs/models.png)
+
 Press **Tab** once. The catalog Potluck ships, with what is on this machine:
 a filled dot is the loaded model, a hollow dot an installed one, and the
 right-hand column shows `loaded`, `installed`, the download size, or a live

@@ -627,7 +627,9 @@ Item {
 
   // Close the app's window the way the compositor would on Super+W: a normal
   // close request, so the app can shut its sidecar down cleanly. Matches the
-  // window the same way omarchy-launch-or-focus finds it.
+  // window the same way omarchy-launch-or-focus finds it, and speaks both
+  // dispatcher dialects the same way it does: the Lua form Hyprland 0.56+
+  // takes, then the classic one for older releases.
   function closeApp() {
     closeProc.running = true
     root.modelsNotice = "closing Potluck"
@@ -637,7 +639,9 @@ Item {
     id: closeProc
     command: ["bash", "-c",
       'addr=$(hyprctl clients -j | jq -r \'.[] | select((.class | test("\\\\bpotluck-ai-desktop\\\\b|^Potluck AI"; "i")) or (.title | test("^Potluck AI"; "i"))) | .address\' | head -n1);'
-      + ' [ -n "$addr" ] && hyprctl dispatch closewindow "address:$addr" >/dev/null']
+      + ' [ -n "$addr" ] || exit 0;'
+      + ' hyprctl dispatch "hl.dsp.window.close({ window = \\"address:$addr\\" })" >/dev/null 2>&1'
+      + ' || hyprctl dispatch closewindow "address:$addr" >/dev/null 2>&1']
   }
 
   // ---------------------------------------------------------------------------

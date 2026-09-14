@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "newtorob.potluck",
   "name": "Potluck",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Rob Newton",
   "license": "AGPL-3.0",
   "description": "Potluck local-AI in the Omarchy bar and a summoned overlay: sidecar health, the loaded model and the device it runs on, streamed answers, a model manager (load, unload, download), app open/close, and a usage view.",
