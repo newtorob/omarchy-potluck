@@ -31,6 +31,9 @@ Item {
   readonly property string launchCommand: (settings && settings.launchCommand)
     ? String(settings.launchCommand)
     : "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop"
+  readonly property string clickAction: (settings && settings.clickAction)
+    ? String(settings.clickAction)
+    : "Ask overlay"
 
   // ---- observed state ----
   property bool online: false
@@ -211,6 +214,23 @@ Item {
     return (Math.round(v * 10) / 10).toFixed(1) + " GB"
   }
 
+  // -------------------------------------------------------------------------
+  // Actions
+  // -------------------------------------------------------------------------
+
+  // The overlay is a second kind on this same plugin, but it is a separate
+  // instance: the bar widget cannot call into it directly. Route through the
+  // shell's own summon/hide IPC, which is the same path the keybinding takes,
+  // so both entry points share one notion of whether the overlay is open.
+  function toggleOverlay() {
+    var id = root.moduleName !== "" ? root.moduleName : "newtorob.potluck"
+    if (root.bar) root.bar.run("omarchy-shell shell toggle " + id)
+  }
+
+  function launchApp() {
+    if (root.bar && root.launchCommand !== "") root.bar.run(root.launchCommand)
+  }
+
   function tooltipText() {
     if (!online)
       return "Potluck\nSidecar not running\n" + sidecarUrl
@@ -230,6 +250,9 @@ Item {
       lines.push("RAM " + formatGb(ramAvailableGb) + " free of " + formatGb(ramTotalGb))
     if (gpuName !== "")
       lines.push("GPU " + gpuName)
+    lines.push(root.clickAction === "Launch app"
+      ? "Click app  ·  right ask  ·  middle refresh"
+      : "Click ask  ·  right app  ·  middle refresh")
     return lines.join("\n")
   }
 
@@ -271,7 +294,7 @@ Item {
   MouseArea {
     anchors.fill: parent
     hoverEnabled: true
-    acceptedButtons: Qt.LeftButton | Qt.MiddleButton
+    acceptedButtons: Qt.LeftButton | Qt.MiddleButton | Qt.RightButton
 
     onEntered: if (root.bar) root.bar.showTooltip(root, root.tooltipText())
     onExited: if (root.bar) root.bar.hideTooltip(root)
@@ -281,7 +304,14 @@ Item {
         root.refresh()
         return
       }
-      if (root.bar && root.launchCommand !== "") root.bar.run(root.launchCommand)
+      // Right-click is always the app, whatever left-click is bound to, so the
+      // launch path never disappears behind a setting.
+      if (mouse.button === Qt.RightButton) {
+        root.launchApp()
+        return
+      }
+      if (root.clickAction === "Launch app") root.launchApp()
+      else root.toggleOverlay()
     }
   }
 }

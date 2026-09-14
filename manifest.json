@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "Potluck",
-    "description": "One bar pill: whether the Potluck sidecar is running, which model is loaded, and how much RAM is left. Click to launch or focus the app.",
+    "description": "One bar pill: whether the Potluck sidecar is running, which model is loaded, and how much RAM is left. Left-click opens the Ask overlay; right-click launches or focuses the app.",
     "category": "AI",
     "allowMultiple": false,
     "defaultSection": "right",
@@ -24,7 +24,8 @@
       "sidecarUrl": "http://127.0.0.1:8321",
       "refreshIntervalSec": 10,
       "showModelName": true,
-      "launchCommand": "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop"
+      "launchCommand": "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop",
+      "clickAction": "Ask overlay"
     },
     "schema": [
       {
@@ -53,8 +54,20 @@
       {
         "key": "launchCommand",
         "type": "command",
-        "label": "Click action",
-        "defaultValue": "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop"
+        "label": "App command",
+        "defaultValue": "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop",
+        "description": "Run on right-click, and on left-click when the click action below is set to launch the app."
+      },
+      {
+        "key": "clickAction",
+        "type": "enum",
+        "label": "Left-click action",
+        "options": [
+          "Ask overlay",
+          "Launch app"
+        ],
+        "defaultValue": "Ask overlay",
+        "description": "Right-click always runs the app command and middle-click always refreshes, whichever this is set to."
       }
     ]
   },

@@ -14,8 +14,10 @@ overlay that streams from the local model without opening the app.
 | Dim hollow | Potluck is not running |
 
 Hover for detail: model and context window, installed models and disk used,
-free RAM, GPU. Left-click launches or focuses the app; middle-click forces a
-refresh.
+free RAM, GPU. Left-click opens the Ask overlay, right-click launches or
+focuses the app, and middle-click forces a refresh. Set `clickAction` to
+`Launch app` if you would rather left-click go straight to the app; right-click
+runs it either way.
 
 ## Ask overlay
 
@@ -82,7 +84,8 @@ hot-reload normally.
 | `sidecarUrl` | `http://127.0.0.1:8321` | The Potluck local sidecar |
 | `refreshIntervalSec` | `10` | Bar widget poll interval, 2–300s |
 | `showModelName` | `true` | Off shows just the dot — suits a vertical bar |
-| `launchCommand` | `omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop` | Left-click action |
+| `launchCommand` | `omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop` | Run on right-click, and on left-click when `clickAction` is `Launch app` |
+| `clickAction` | `Ask overlay` | What left-click does: `Ask overlay` or `Launch app` |
 
 ## Requirements and dependencies
 
