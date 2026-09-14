@@ -60,6 +60,8 @@ Item {
   // Whether the app's local API (the /v1 gateway) is switched on. The Ask
   // overlay needs it; the tooltip says so while it is off.
   property bool gatewayEnabled: false
+  // Serve mode: the sidecar as a systemd user service, kept loaded at login.
+  property bool serving: false
 
   // Anything on the sidecar port is untrusted: --max-time bounds how long a
   // response may take, not how large it may be, so every read is capped in
@@ -183,6 +185,7 @@ Item {
     root.ramTotalGb = isFinite(t) && t > 0 ? Math.min(t, 1e12) / 1048576 : 0
     root.ramAvailableGb = isFinite(a) && a >= 0 ? Math.min(a, 1e12) / 1048576 : 0
     root.gatewayEnabled = d.gateway === true
+    root.serving = d.serving === true
     var name = root.clamp(d.name)
     if (name !== "") root.modelName = name
   }
@@ -210,7 +213,8 @@ Item {
       + ' gw=false; c="$d/config.json"; if [ -f "$c" ] && [ ! -L "$c" ]; then gw=$(head -c 65536 "$c" | jq -r "if .gateway.enabled == true then true else false end" 2>/dev/null); fi;'
       + ' name=""; k="$d/data/model_catalog_cache.json"; if [ -n "$POTLUCK_SLUG" ] && [ -f "$k" ] && [ ! -L "$k" ]; then name=$(head -c 262144 "$k" | jq -r --arg s "$POTLUCK_SLUG" "[.models[]? | select(.slug == \\$s) | .name // empty] | first // \\"\\"" 2>/dev/null | head -c 96); fi;'
       + ' case "$gw" in true|false) ;; *) gw=false ;; esac;'
-      + ' jq -cn --argjson n "$n" --argjson b "$b" --argjson t "${t:-0}" --argjson a "${a:-0}" --argjson gw "$gw" --arg name "$name" "{models:\\$n, bytes:\\$b, memTotalKb:\\$t, memAvailKb:\\$a, gateway:\\$gw, name:\\$name}"'
+      + ' sv=false; systemctl --user is-active --quiet potluck-sidecar 2>/dev/null && sv=true;'
+      + ' jq -cn --argjson n "$n" --argjson b "$b" --argjson t "${t:-0}" --argjson a "${a:-0}" --argjson gw "$gw" --argjson sv "$sv" --arg name "$name" "{models:\\$n, bytes:\\$b, memTotalKb:\\$t, memAvailKb:\\$a, gateway:\\$gw, serving:\\$sv, name:\\$name}"'
       + ' | head -c ' + root.maxLocalBytes]
     stdout: StdioCollector {
       waitForEnd: true
@@ -287,6 +291,8 @@ Item {
       lines.push(runsOnText())
     if (ramTotalGb > 0)
       lines.push("RAM " + formatGb(ramAvailableGb) + " free of " + formatGb(ramTotalGb))
+    if (serving)
+      lines.push("Serve mode: kept loaded at login (potluck-sidecar user service)")
     if (!gatewayEnabled)
       lines.push("Ask needs the local API on: Potluck → Settings → Connect tools")
     lines.push(root.clickAction === "Launch app"
