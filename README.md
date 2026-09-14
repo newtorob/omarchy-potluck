@@ -30,8 +30,9 @@ see the next section.
 Summon it with a keybinding (see below): type a question, get a streamed answer
 from the local model.
 
-- **Enter** send · **Tab** switch to the usage view · **Ctrl+C** copy the
-  answer · **Esc** cancel a stream, then close
+- **Enter** send · **Tab** cycle Ask → Models → Usage · **Ctrl+C** copy the
+  answer · **Ctrl+O** open the app · **Ctrl+W** close it · **Esc** cancel a
+  stream, then close
 - Reasoning-model `<think>` blocks are separated from the answer rather than
   dumped into it, so the reply stays readable.
 - Streams via `curl -N` into a `SplitParser`, the same shape the first-party
@@ -51,6 +52,35 @@ then it explains what to do instead of answering.
 Every ask is sent with `X-Potluck-Scope: local`, so it runs on this machine or
 fails with a clear message. It is never routed to a household peer, a trusted
 circle or the pool, whatever the app's own routing default is.
+
+### Summon with a payload
+
+```bash
+# Open with a question already sent (the menu snippet uses this for "Ask about clipboard").
+omarchy-shell shell summon newtorob.potluck '{"prompt": "Explain: …"}'
+# Open straight onto the model manager or the usage view.
+omarchy-shell shell summon newtorob.potluck '{"view": "models"}'
+# Act on a model without opening anything.
+omarchy-shell shell call newtorob.potluck act '{"slug": "qwen3-4b-instruct-2507-q4", "action": "load"}'
+#   actions: load · unload · install · cancel-download
+```
+
+## Models view
+
+Press **Tab** once. The catalog Potluck ships, with what is on this machine:
+a filled dot is the loaded model, a hollow dot an installed one, and the
+right-hand column shows `loaded`, `installed`, the download size, or a live
+download (`downloading 43% · 12 MB/s`, then `verifying…`).
+
+- **Enter** loads the selected model if it is installed, otherwise starts its
+  download (verified against the catalog's hash by the sidecar, exactly as the
+  app does it) · **u** unloads the loaded model · **x** cancels a download ·
+  **j/k** move · **r** refresh · double-click acts like Enter
+- A load reports where it landed: `loaded qwen3-8b-q4 in 4.0 s on GPU · vulkan`.
+
+This needs Potluck 0.1.6 or later, which exposes model management on the
+local API (`/v1/potluck/models`). Older versions answer "Not Found" and the
+view says so.
 
 ## Usage view
 
@@ -99,6 +129,9 @@ hot-reload normally.
 
 ## Settings
 
+Bar widget only; the overlay reads the same `~/.potluck/config.json` and
+uses the default app command for Ctrl+O.
+
 | Key | Default | What it does |
 |---|---|---|
 | `sidecarUrl` | `http://127.0.0.1:8321` | The Potluck local sidecar |
@@ -144,6 +177,11 @@ process the desktop app uses. It reads `/health`, and posts to
 `/v1/chat/completions` with `X-Potluck-Scope: local` when you ask something.
 It sends nothing off the machine and never touches your Potluck account or the
 cloud API.
+
+The Models view calls `/v1/potluck/models` (list, load, unload, install,
+cancel) with the same key; a download is fetched and verified by the sidecar,
+never by the plugin. Ctrl+W asks Hyprland to close the app's window, the same
+close request Super+W sends.
 
 It reads four things from disk, all yours and all bounded in size:
 `~/.potluck/config.json` (whether the local API is on, and its key, which is

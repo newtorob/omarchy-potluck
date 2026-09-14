@@ -39,6 +39,21 @@ Item {
   property string gatewayKey: ""
   property bool copied: false
 
+  // ---- models view state, from GET /v1/potluck/models ----
+  property var models: []          // [{slug, name, tier, size_bytes, size_on_disk, installed, loaded, download}]
+  property string loadedSlug: ""
+  property int cursor: 0
+  onCursorChanged: modelsFlick.reveal(cursor)
+  property string busySlug: ""     // a load or unload in flight
+  property string busyAction: ""
+  property string modelsError: ""
+  property string modelsNotice: ""
+  readonly property int maxModelsBytes: 262144
+  readonly property int maxModels: 200
+  // The overlay has no settings of its own, so the app command matches the
+  // bar widget's default. Ctrl+O runs it from any view.
+  readonly property string launchCommand: "omarchy-launch-or-focus potluck-ai-desktop potluck-ai-desktop"
+
   // ---- ask state ----
   property string prompt: ""
   property string thinking: ""
@@ -108,6 +123,11 @@ Item {
       var payload = JSON.parse(String(payloadJson || "{}"))
       if (payload && typeof payload.prompt === "string")
         summoned = payload.prompt.substring(0, root.maxSummonPromptChars).trim()
+      // {"view": "models"} or {"view": "usage"} opens straight onto that view.
+      if (payload && (payload.view === "models" || payload.view === "usage")) {
+        root.mode = payload.view
+        if (root.mode === "models") root.refreshModels()
+      }
     } catch (e) {}
     if (summoned !== "" && !root.streaming) {
       input.text = summoned
@@ -191,7 +211,9 @@ Item {
     if (d.indexOf("gateway API key") !== -1)
       return "Potluck rejected the API key. Close and reopen this overlay to re-read ~/.potluck/config.json."
     if (d.indexOf("No local model") !== -1 || d.indexOf("No model loaded") !== -1)
-      return "No model is loaded. Open Potluck and load one."
+      return "No model is loaded. Open Potluck and load one, or Tab to Models."
+    if (d === "Not Found")
+      return "This Potluck is too old to manage models from here. Update to 0.1.6 or later."
     return d !== "" ? d.substring(0, 300) : "The sidecar returned an error."
   }
 
@@ -585,6 +607,250 @@ Item {
   onOpenedChanged: if (opened) { healthProc.running = true; configReader.running = true }
 
   // ---------------------------------------------------------------------------
+  // Views
+  // ---------------------------------------------------------------------------
+
+  function cycleMode() {
+    root.mode = root.mode === "ask" ? "models" : (root.mode === "models" ? "usage" : "ask")
+    if (root.mode === "ask") Qt.callLater(function () { input.forceActiveFocus() })
+    if (root.mode === "models") root.refreshModels()
+  }
+
+  // ---------------------------------------------------------------------------
+  // The app itself
+  // ---------------------------------------------------------------------------
+
+  function openApp() {
+    Quickshell.execDetached(["bash", "-c", root.launchCommand])
+    root.modelsNotice = "opening Potluck"
+  }
+
+  // Close the app's window the way the compositor would on Super+W: a normal
+  // close request, so the app can shut its sidecar down cleanly. Matches the
+  // window the same way omarchy-launch-or-focus finds it.
+  function closeApp() {
+    closeProc.running = true
+    root.modelsNotice = "closing Potluck"
+  }
+
+  Process {
+    id: closeProc
+    command: ["bash", "-c",
+      'addr=$(hyprctl clients -j | jq -r \'.[] | select((.class | test("\\\\bpotluck-ai-desktop\\\\b|^Potluck AI"; "i")) or (.title | test("^Potluck AI"; "i"))) | .address\' | head -n1);'
+      + ' [ -n "$addr" ] && hyprctl dispatch closewindow "address:$addr" >/dev/null']
+  }
+
+  // ---------------------------------------------------------------------------
+  // Models: the keyed management surface at /v1/potluck/models
+  // ---------------------------------------------------------------------------
+
+  // Same shape as ask(): key, URL and method travel as environment values,
+  // never as text in the command line; the body is capped in the pipe.
+  function apiCommand(cap) {
+    return ["bash", "-c",
+      'auth=(); if [ -n "$POTLUCK_KEY" ]; then auth=(-H "Authorization: Bearer $POTLUCK_KEY"); fi;'
+      + ' curl -s --max-time "$POTLUCK_TIMEOUT" -X "$POTLUCK_METHOD" "$POTLUCK_URL" "${auth[@]}"'
+      + ' -H "Content-Type: application/json" | head -c ' + cap]
+  }
+
+  function apiEnv(method, path, timeoutSec) {
+    return {
+      "POTLUCK_KEY": root.gatewayKey,
+      "POTLUCK_URL": root.sidecarUrl + path,
+      "POTLUCK_METHOD": method,
+      "POTLUCK_TIMEOUT": String(timeoutSec)
+    }
+  }
+
+  function refreshModels() {
+    if (modelsProc.running) return
+    modelsProc.environment = root.apiEnv("GET", "/v1/potluck/models", 10)
+    modelsProc.command = root.apiCommand(root.maxModelsBytes)
+    modelsProc.running = true
+  }
+
+  function slugOk(v) { return /^[A-Za-z0-9._\-]{1,96}$/.test(String(v || "")) }
+
+  // Scriptable: `omarchy-shell shell call newtorob.potluck act
+  // '{"slug": "qwen3-4b-instruct-2507-q4", "action": "load"}'`. The same
+  // guarded path as the keys, so a menu entry or keybinding can load, unload,
+  // install or cancel a download without opening the overlay.
+  function act(payloadJson) {
+    var p
+    try { p = JSON.parse(String(payloadJson || "{}")) } catch (e) { return "bad payload" }
+    if (!p || typeof p !== "object" || !root.slugOk(p.slug)) return "bad slug"
+    root.modelAction(String(p.slug), String(p.action || ""))
+    return root.busySlug !== "" ? "started" : "refused"
+  }
+
+  function applyModels(raw) {
+    var text = String(raw || "")
+    if (text.length === 0) { root.modelsError = "Potluck is not running."; return }
+    if (text.length >= root.maxModelsBytes) { root.modelsError = "The model list was too large to read."; return }
+    var d
+    try { d = JSON.parse(text) } catch (e) { root.modelsError = "Unreadable reply from the sidecar."; return }
+    if (d && d.detail !== undefined) { root.modelsError = root.friendlyError(d.detail); return }
+    var list = d && Array.isArray(d.models) ? d.models : []
+    var clean = []
+    for (var i = 0; i < list.length && clean.length < root.maxModels; i++) {
+      var m = list[i]
+      if (!m || typeof m !== "object" || !root.slugOk(m.slug)) continue
+      var dl = m.download && typeof m.download === "object" ? m.download : null
+      clean.push({
+        slug: String(m.slug),
+        name: String(m.name || m.slug).substring(0, 64),
+        tier: String(m.tier || "").substring(0, 16),
+        sizeBytes: Math.max(0, Math.min(Number(m.size_on_disk || m.size_bytes || 0) || 0, 1e13)),
+        installed: m.installed === true,
+        loaded: m.loaded === true,
+        dlStatus: dl ? String(dl.status || "").substring(0, 16) : "",
+        dlDone: dl ? Math.max(0, Number(dl.bytes_downloaded) || 0) : 0,
+        dlTotal: dl ? Math.max(0, Number(dl.bytes_total) || 0) : 0,
+        dlSpeed: dl ? Math.max(0, Number(dl.speed_bps) || 0) : 0,
+        dlError: dl && dl.error ? String(dl.error).substring(0, 120) : ""
+      })
+    }
+    root.models = clean
+    root.loadedSlug = root.slugOk(d.loaded) ? String(d.loaded) : ""
+    if (root.cursor >= clean.length) root.cursor = Math.max(0, clean.length - 1)
+    root.modelsError = ""
+  }
+
+  function anyDownloading() {
+    for (var i = 0; i < root.models.length; i++) {
+      var st = root.models[i].dlStatus
+      if (st === "downloading" || st === "verifying") return true
+    }
+    return false
+  }
+
+  function installedCount() {
+    var n = 0
+    for (var i = 0; i < root.models.length; i++) if (root.models[i].installed) n++
+    return n
+  }
+
+  // One action at a time. A load blocks for seconds and holds the runtime
+  // lock, so the view marks the slug busy and polls the list until it ends.
+  function modelAction(slug, action) {
+    if (actionProc.running || !root.slugOk(slug)) return
+    var timeouts = { "load": 600, "unload": 60, "install": 30, "cancel-download": 10 }
+    if (timeouts[action] === undefined) return
+    root.busySlug = slug
+    root.busyAction = action
+    root.modelsError = ""
+    root.modelsNotice = ""
+    actionProc.environment = root.apiEnv("POST", "/v1/potluck/models/" + slug + "/" + action, timeouts[action])
+    actionProc.command = root.apiCommand(root.maxHealthBytes)
+    actionProc.running = true
+  }
+
+  function onActionResult(raw) {
+    var text = String(raw || "")
+    var d = null
+    try { d = text.length > 0 && text.length < root.maxHealthBytes ? JSON.parse(text) : null } catch (e) {}
+    if (!d || typeof d !== "object") {
+      root.modelsError = text.length === 0 ? "Potluck is not running." : "Unreadable reply from the sidecar."
+      return
+    }
+    if (d.detail !== undefined) { root.modelsError = root.friendlyError(d.detail); return }
+    if (d.load_time_seconds !== undefined) {
+      var inf = d.inference && typeof d.inference === "object" ? d.inference : null
+      var where = inf ? (inf.device_kind === "gpu" ? "GPU" : inf.device_kind === "mixed" ? "GPU + CPU" : "CPU")
+        + (inf.backend && inf.backend !== "cpu" ? " · " + String(inf.backend).substring(0, 16) : "") : ""
+      root.modelsNotice = "loaded " + String(d.model_id || "").substring(0, 64)
+        + " in " + (Math.round(Number(d.load_time_seconds) * 10) / 10) + " s"
+        + (where !== "" ? " on " + where : "")
+      return
+    }
+    var status = String(d.status || "").substring(0, 32)
+    var said = {
+      "downloading": "download started", "already_downloading": "already downloading",
+      "already_installed": "already installed", "unloaded": "unloaded", "cancelled": "download cancelled"
+    }
+    root.modelsNotice = said[status] || status
+  }
+
+  function currentModel() {
+    return root.cursor >= 0 && root.cursor < root.models.length ? root.models[root.cursor] : null
+  }
+
+  // Keys for the models view. Returns true when the key was used.
+  function modelsKey(event) {
+    var k = event.key
+    if (k === Qt.Key_J || k === Qt.Key_Down) { if (root.cursor < root.models.length - 1) root.cursor++; return true }
+    if (k === Qt.Key_K || k === Qt.Key_Up) { if (root.cursor > 0) root.cursor--; return true }
+    if (k === Qt.Key_R) { root.refreshModels(); return true }
+    var m = root.currentModel()
+    if (k === Qt.Key_Return || k === Qt.Key_Enter) {
+      if (!m || root.busySlug !== "") return true
+      if (m.dlStatus === "downloading" || m.dlStatus === "verifying") return true
+      if (m.loaded) { root.modelsNotice = m.name + " is already loaded"; return true }
+      root.modelAction(m.slug, m.installed ? "load" : "install")
+      return true
+    }
+    if (k === Qt.Key_U) {
+      if (root.loadedSlug !== "" && root.busySlug === "") root.modelAction(root.loadedSlug, "unload")
+      return true
+    }
+    if (k === Qt.Key_X) {
+      if (m && (m.dlStatus === "downloading" || m.dlStatus === "verifying")) root.modelAction(m.slug, "cancel-download")
+      return true
+    }
+    return false
+  }
+
+  function fmtBytes(b) {
+    var n = Number(b) || 0
+    if (n >= 1073741824) return (Math.round(n / 1073741824 * 10) / 10).toFixed(1) + " GB"
+    if (n >= 1048576) return Math.round(n / 1048576) + " MB"
+    return Math.round(n / 1024) + " KB"
+  }
+
+  function stateText(m) {
+    if (root.busySlug === m.slug) return root.busyAction === "load" ? "loading…" : root.busyAction + "…"
+    if (m.dlStatus === "downloading") {
+      var pct = m.dlTotal > 0 ? Math.round(m.dlDone / m.dlTotal * 100) : 0
+      return "downloading " + pct + "%" + (m.dlSpeed > 0 ? " · " + root.fmtBytes(m.dlSpeed) + "/s" : "")
+    }
+    if (m.dlStatus === "verifying") return "verifying…"
+    if (m.dlStatus === "error") return "download failed"
+    if (m.loaded) return "loaded"
+    if (m.installed) return "installed"
+    return root.fmtBytes(m.sizeBytes) + " download"
+  }
+
+  Process {
+    id: modelsProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.applyModels(text)
+    }
+  }
+
+  Process {
+    id: actionProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.onActionResult(text)
+    }
+    onExited: function (exitCode) {
+      root.busySlug = ""
+      root.busyAction = ""
+      root.refreshModels()
+      healthProc.running = true
+    }
+  }
+
+  // Poll while something is in flight so progress and "loading…" move.
+  Timer {
+    interval: 2000
+    repeat: true
+    running: root.opened && root.mode === "models" && (root.busySlug !== "" || root.anyDownloading())
+    onTriggered: root.refreshModels()
+  }
+
+  // ---------------------------------------------------------------------------
   // UI
   // ---------------------------------------------------------------------------
 
@@ -614,8 +880,15 @@ Item {
           else root.dismiss()
           event.accepted = true
         } else if (event.key === Qt.Key_Tab) {
-          root.mode = root.mode === "ask" ? "usage" : "ask"
-          if (root.mode === "ask") Qt.callLater(function () { input.forceActiveFocus() })
+          root.cycleMode()
+          event.accepted = true
+        } else if (event.key === Qt.Key_O && (event.modifiers & Qt.ControlModifier)) {
+          root.openApp()
+          event.accepted = true
+        } else if (event.key === Qt.Key_W && (event.modifiers & Qt.ControlModifier)) {
+          root.closeApp()
+          event.accepted = true
+        } else if (root.mode === "models" && root.modelsKey(event)) {
           event.accepted = true
         } else if (event.key === Qt.Key_C && (event.modifiers & Qt.ControlModifier)) {
           // Ctrl+C copies the finished answer, unless the input has its own
@@ -655,7 +928,7 @@ Item {
               textFormat: Text.PlainText
               anchors.left: parent.left
               anchors.verticalCenter: parent.verticalCenter
-              text: root.mode === "ask" ? "Ask Potluck" : "Potluck usage"
+              text: root.mode === "ask" ? "Ask Potluck" : (root.mode === "models" ? "Potluck models" : "Potluck usage")
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: 15
@@ -668,7 +941,9 @@ Item {
               anchors.verticalCenter: parent.verticalCenter
               text: root.mode === "ask"
                 ? (root.modelId !== "" ? root.modelId : "no model")
-                : (root.totalAsks() + " asks recorded")
+                : (root.mode === "models"
+                  ? (root.models.length + " in catalog · " + root.installedCount() + " installed")
+                  : (root.totalAsks() + " asks recorded"))
               color: root.foreground
               opacity: 0.55
               font.family: root.fontFamily
@@ -705,7 +980,7 @@ Item {
                 textFormat: Text.PlainText
                 anchors.verticalCenter: parent.verticalCenter
                 visible: input.text === ""
-                text: "Ask the local model…  ·  Enter to send, Tab for usage, Esc to close"
+                text: "Ask the local model…  ·  Enter to send, Tab for models, Esc to close"
                 color: root.foreground
                 opacity: 0.4
                 font.family: root.fontFamily
@@ -790,7 +1065,129 @@ Item {
                   + (Math.round(root.elapsedMs / 100) / 10) + "s · Ctrl+C to copy"
               if (!root.gatewayEnabled)
                 return "Local API off? Potluck → Settings → Connect tools · Esc to close"
-              return "Enter to send · Tab for usage · Esc to close"
+              return "Enter to send · Tab for models and usage · Ctrl+O open app · Esc to close"
+            }
+          }
+
+          // ---- models mode ----
+          Column {
+            visible: root.mode === "models"
+            width: parent.width
+            spacing: 8
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              visible: root.modelsError !== "" || root.modelsNotice !== ""
+              text: root.modelsError !== "" ? root.modelsError : root.modelsNotice
+              color: root.modelsError !== "" ? "#e06c75" : root.foreground
+              opacity: root.modelsError !== "" ? 1.0 : 0.6
+              wrapMode: Text.Wrap
+              font.family: root.fontFamily
+              font.pixelSize: 12
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              visible: root.models.length === 0 && root.modelsError === ""
+              text: "Reading the catalog…"
+              color: root.foreground
+              opacity: 0.45
+              font.family: root.fontFamily
+              font.pixelSize: 12
+            }
+
+            Flickable {
+              id: modelsFlick
+              width: parent.width
+              height: card.height - 36 - 22 - 24 - 40 - (root.modelsError !== "" || root.modelsNotice !== "" ? 28 : 0)
+              contentWidth: width
+              contentHeight: modelsCol.height
+              clip: true
+              boundsBehavior: Flickable.StopAtBounds
+
+              // Keep the cursor row in view as j/k move it.
+              function reveal(index) {
+                var y = index * 34
+                if (y < contentY) contentY = y
+                else if (y + 34 > contentY + height) contentY = y + 34 - height
+              }
+
+              Column {
+                id: modelsCol
+                width: parent.width
+                spacing: 0
+
+                Repeater {
+                  model: root.models
+
+                  delegate: Rectangle {
+                    width: modelsCol.width
+                    height: 34
+                    radius: 5
+                    color: index === root.cursor ? root.accent : "transparent"
+                    opacity: index === root.cursor ? 0.9 : 1.0
+
+                    Rectangle {
+                      // The loaded model carries a filled dot; installed ones a hollow one.
+                      anchors.left: parent.left
+                      anchors.leftMargin: 10
+                      anchors.verticalCenter: parent.verticalCenter
+                      width: 7; height: 7; radius: 3.5
+                      color: modelData.loaded ? root.foreground : "transparent"
+                      border.width: modelData.installed ? 1 : 0
+                      border.color: root.foreground
+                      opacity: modelData.installed ? 1.0 : 0.0
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      anchors.left: parent.left
+                      anchors.leftMargin: 26
+                      anchors.right: stateLabel.left
+                      anchors.rightMargin: 12
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: modelData.name + "   " + modelData.tier
+                      color: root.foreground
+                      opacity: modelData.installed ? 1.0 : 0.7
+                      elide: Text.ElideRight
+                      font.family: root.fontFamily
+                      font.pixelSize: 12
+                      font.bold: modelData.loaded
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      id: stateLabel
+                      anchors.right: parent.right
+                      anchors.rightMargin: 10
+                      anchors.verticalCenter: parent.verticalCenter
+                      text: root.stateText(modelData)
+                      color: root.foreground
+                      opacity: 0.6
+                      font.family: root.fontFamily
+                      font.pixelSize: 11
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      onClicked: root.cursor = index
+                      onDoubleClicked: { root.cursor = index; root.modelsKey({ key: Qt.Key_Return }) }
+                    }
+                  }
+                }
+              }
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              color: root.foreground
+              opacity: 0.55
+              font.family: root.fontFamily
+              font.pixelSize: 11
+              elide: Text.ElideRight
+              text: "Enter load or download · u unload · x cancel · j/k move · r refresh · Ctrl+O open app · Ctrl+W close app"
             }
           }
 
@@ -842,7 +1239,7 @@ Item {
             Text {
               textFormat: Text.PlainText
               visible: root.history.length === 0
-              text: "No asks recorded yet. Press Tab and ask something."
+              text: "No asks recorded yet. Tab back to Ask and ask something."
               color: root.foreground
               opacity: 0.45
               font.family: root.fontFamily
